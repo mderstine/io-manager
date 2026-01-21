@@ -31,6 +31,84 @@ class WriteMode(Enum):
     OVERWRITE_PARTITIONS = "overwrite_partitions"  # Delete & replace only partitions in DataFrame
 
 
+class ReadMode(Enum):
+    """Read mode options for data readers."""
+
+    STRICT = "strict"  # Fail if source doesn't exist (default)
+    EMPTY_IF_MISSING = "empty"  # Return empty DataFrame
+    WARN_IF_MISSING = "warn"  # Log warning, return empty DataFrame
+
+
+# Type alias for filter expressions: (column, operator, value)
+# Operators: "=", "!=", ">", ">=", "<", "<=", "in", "not in"
+FilterExpr = tuple[str, str, Any]
+
+
+# =============================================================================
+# Filter Utilities
+# =============================================================================
+
+
+def _quote_value(value: Any) -> str:
+    """Quote a value for SQL/DuckDB."""
+    if isinstance(value, str):
+        escaped = value.replace("'", "''")
+        return f"'{escaped}'"
+    elif isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    elif value is None:
+        return "NULL"
+    else:
+        return str(value)
+
+
+def build_where_clause(
+    partitions: dict[str, list] | None = None,
+    filters: list[FilterExpr] | None = None,
+) -> str | None:
+    """
+    Build a WHERE clause from partitions and filters.
+
+    Args:
+        partitions: Partition column filters as {column: [values]}.
+        filters: Row-level filters as list of (column, operator, value) tuples.
+
+    Returns:
+        WHERE clause string (e.g., "WHERE year = 2024 AND amount > 100"),
+        or None if no conditions.
+    """
+    conditions = []
+
+    # Partition conditions (always uses IN or =)
+    if partitions:
+        for col, values in partitions.items():
+            if not values:
+                continue
+            if len(values) == 1:
+                conditions.append(f"{col} = {_quote_value(values[0])}")
+            else:
+                quoted = ", ".join(_quote_value(v) for v in values)
+                conditions.append(f"{col} IN ({quoted})")
+
+    # Filter conditions
+    if filters:
+        for col, op, value in filters:
+            op_upper = op.upper().strip()
+            if op_upper == "IN":
+                quoted = ", ".join(_quote_value(v) for v in value)
+                conditions.append(f"{col} IN ({quoted})")
+            elif op_upper == "NOT IN":
+                quoted = ", ".join(_quote_value(v) for v in value)
+                conditions.append(f"{col} NOT IN ({quoted})")
+            else:
+                conditions.append(f"{col} {op} {_quote_value(value)}")
+
+    if not conditions:
+        return None
+
+    return "WHERE " + " AND ".join(conditions)
+
+
 # =============================================================================
 # Base Classes
 # =============================================================================
@@ -40,8 +118,29 @@ class Reader(ABC):
     """Abstract base class for data readers."""
 
     @abstractmethod
-    def read(self, source: str, **kwargs) -> pl.DataFrame:
-        """Read data from source and return a Polars DataFrame."""
+    def read(
+        self,
+        source: str,
+        partitions: dict[str, list] | None = None,
+        filters: list[FilterExpr] | None = None,
+        mode: ReadMode = ReadMode.STRICT,
+        **kwargs,
+    ) -> pl.DataFrame:
+        """
+        Read data from source and return a Polars DataFrame.
+
+        Args:
+            source: Data source identifier (path, table name, query).
+            partitions: Partition column filters as {column: [values]}.
+                       Enables partition pruning for compatible sources.
+            filters: Row-level filters as list of (column, operator, value) tuples.
+                    Operators: =, !=, >, >=, <, <=, in, not in
+            mode: Behavior when source doesn't exist.
+            **kwargs: Engine-specific options.
+
+        Returns:
+            Polars DataFrame.
+        """
         pass
 
 
@@ -70,19 +169,56 @@ class SqlServerReader(Reader):
         """
         self.connection_string = connection_string
 
-    def read(self, source: str, **kwargs) -> pl.DataFrame:
+    def read(
+        self,
+        source: str,
+        partitions: dict[str, list] | None = None,
+        filters: list[FilterExpr] | None = None,
+        mode: ReadMode = ReadMode.STRICT,
+        **kwargs,
+    ) -> pl.DataFrame:
         """
         Read data from SQL Server.
 
         Args:
             source: SQL query or table name.
+            partitions: Partition column filters as {column: [values]}.
+                       Translates to WHERE col IN (...) clauses.
+            filters: Row-level filters as list of (column, operator, value) tuples.
+            mode: Behavior when query fails (STRICT raises, others return empty).
             **kwargs: Additional arguments passed to pl.read_database.
 
         Returns:
             Polars DataFrame with query results.
         """
-        query = source if source.strip().upper().startswith("SELECT") else f"SELECT * FROM {source}"
-        return pl.read_database(query, self.connection_string, **kwargs)
+        # Determine base query
+        is_query = source.strip().upper().startswith("SELECT")
+
+        if is_query:
+            # User provided a query - wrap it to add filters
+            if partitions or filters:
+                where_clause = build_where_clause(partitions, filters)
+                if where_clause:
+                    # Remove "WHERE " prefix to use in subquery
+                    conditions = where_clause[6:]
+                    query = f"SELECT * FROM ({source}) AS subq WHERE {conditions}"
+                else:
+                    query = source
+            else:
+                query = source
+        else:
+            # Table name provided
+            where_clause = build_where_clause(partitions, filters) or ""
+            query = f"SELECT * FROM {source} {where_clause}"
+
+        try:
+            return pl.read_database(query, self.connection_string, **kwargs)
+        except Exception as e:
+            if mode == ReadMode.STRICT:
+                raise
+            if mode == ReadMode.WARN_IF_MISSING:
+                logger.warning(f"Failed to read from {source}: {e}. Returning empty DataFrame.")
+            return pl.DataFrame()
 
 
 class SqlServerWriter(Writer):
@@ -147,6 +283,9 @@ class HiveReader(Reader):
     def read(
         self,
         source: str,
+        partitions: dict[str, list] | None = None,
+        filters: list[FilterExpr] | None = None,
+        mode: ReadMode = ReadMode.STRICT,
         hive_partitioning: bool = True,
         **kwargs,
     ) -> pl.DataFrame:
@@ -154,7 +293,12 @@ class HiveReader(Reader):
         Read hive-partitioned parquet files.
 
         Args:
-            source: Path to parquet files (can include globs like '**/*.parquet').
+            source: Path to parquet directory (glob pattern added automatically).
+                   Can still include explicit globs like '**/*.parquet'.
+            partitions: Partition column filters as {column: [values]}.
+                       Enables DuckDB partition pushdown.
+            filters: Row-level filters as list of (column, operator, value) tuples.
+            mode: Behavior when source doesn't exist.
             hive_partitioning: Whether to parse hive partition columns.
             **kwargs: Additional arguments passed to DuckDB.
 
@@ -163,15 +307,47 @@ class HiveReader(Reader):
         """
         path = self._resolve_path(source)
 
-        # Build DuckDB query
+        # Handle missing source based on mode
+        if not self._source_exists(path):
+            if mode == ReadMode.STRICT:
+                raise FileNotFoundError(f"Source not found: {path}")
+            if mode == ReadMode.WARN_IF_MISSING:
+                logger.warning(f"Source not found: {path}. Returning empty DataFrame.")
+            return pl.DataFrame()
+
+        # Add glob pattern if not present
+        if "*" not in path:
+            path = f"{path}/**/*.parquet"
+
+        # Build DuckDB query with pushdown
         hive_opt = "true" if hive_partitioning else "false"
-        query = f"SELECT * FROM read_parquet('{path}', hive_partitioning={hive_opt})"
+        where_clause = build_where_clause(partitions, filters) or ""
+
+        query = f"""
+            SELECT * FROM read_parquet('{path}', hive_partitioning={hive_opt})
+            {where_clause}
+        """
 
         # Execute with DuckDB and convert to Polars
         with duckdb.connect() as con:
             result = con.execute(query).pl()
 
         return result
+
+    def _source_exists(self, path: str) -> bool:
+        """Check if source path exists and has parquet files."""
+        # If path contains glob, check the base directory
+        if "*" in path:
+            base = path.split("*")[0].rstrip("/")
+            p = Path(base) if base else Path(".")
+        else:
+            p = Path(path)
+
+        if not p.exists():
+            return False
+        if p.is_file():
+            return p.suffix == ".parquet"
+        return any(p.rglob("*.parquet"))
 
     def _resolve_path(self, source: str) -> str:
         """Resolve path relative to base_path if set."""
@@ -195,6 +371,7 @@ class HiveWriter(Writer):
         df: pl.DataFrame,
         destination: str,
         partition_by: list[str] | None = None,
+        target_partitions: dict[str, list] | None = None,
         mode: WriteMode = WriteMode.OVERWRITE,
         **kwargs,
     ) -> None:
@@ -205,6 +382,9 @@ class HiveWriter(Writer):
             df: Polars DataFrame to write.
             destination: Directory path for output.
             partition_by: Columns to partition by (creates hive-style directories).
+            target_partitions: Explicit partitions to delete before writing
+                              (for OVERWRITE_PARTITIONS mode). If None, infers
+                              from DataFrame values. Format: {column: [values]}.
             mode: Write mode controlling overwrite behavior.
             **kwargs: Additional arguments passed to DuckDB COPY.
         """
@@ -221,7 +401,12 @@ class HiveWriter(Writer):
 
         # Handle OVERWRITE_PARTITIONS mode
         if mode == WriteMode.OVERWRITE_PARTITIONS and partition_by:
-            self._delete_partitions(dest_path, df, partition_by)
+            if target_partitions:
+                # Use explicit partition targets
+                self._delete_explicit_partitions(dest_path, target_partitions, partition_by)
+            else:
+                # Infer from DataFrame (existing behavior)
+                self._delete_partitions(dest_path, df, partition_by)
 
         dest_path.mkdir(parents=True, exist_ok=True)
 
@@ -291,6 +476,41 @@ class HiveWriter(Writer):
             partition_path = path
             for col in partition_cols:
                 partition_path = partition_path / f"{col}={partition[col]}"
+
+            if partition_path.exists():
+                logger.info(f"Deleting partition directory: {partition_path}")
+                shutil.rmtree(partition_path)
+
+    def _delete_explicit_partitions(
+        self,
+        path: Path,
+        target_partitions: dict[str, list],
+        partition_cols: list[str],
+    ) -> None:
+        """Delete explicitly specified partition directories."""
+        if not path.exists():
+            return
+
+        import itertools
+
+        # Build list of values for each partition column in order
+        col_values = []
+        for col in partition_cols:
+            values = target_partitions.get(col, [])
+            if values:
+                col_values.append([(col, v) for v in values])
+            else:
+                # If column not in target_partitions, skip it (partial specification)
+                continue
+
+        if not col_values:
+            return
+
+        # Generate all combinations of partition values
+        for combo in itertools.product(*col_values):
+            partition_path = path
+            for col, val in combo:
+                partition_path = partition_path / f"{col}={val}"
 
             if partition_path.exists():
                 logger.info(f"Deleting partition directory: {partition_path}")
@@ -395,6 +615,8 @@ class IOManager:
         source: str,
         destination: str,
         transform: Callable | None = None,
+        partitions: dict[str, list] | None = None,
+        filters: list[FilterExpr] | None = None,
         read_kwargs: dict[str, Any] | None = None,
         write_kwargs: dict[str, Any] | None = None,
     ) -> pl.DataFrame:
@@ -405,7 +627,9 @@ class IOManager:
             source: Source for reader.
             destination: Destination for writer.
             transform: Optional function to transform the DataFrame.
-            read_kwargs: Arguments passed to reader.
+            partitions: Partition filters passed to reader (convenience).
+            filters: Row filters passed to reader (convenience).
+            read_kwargs: Additional arguments passed to reader.
             write_kwargs: Arguments passed to writer.
 
         Returns:
@@ -413,6 +637,12 @@ class IOManager:
         """
         read_kwargs = read_kwargs or {}
         write_kwargs = write_kwargs or {}
+
+        # Merge convenience params into read_kwargs
+        if partitions:
+            read_kwargs.setdefault("partitions", partitions)
+        if filters:
+            read_kwargs.setdefault("filters", filters)
 
         df = self.read(source, **read_kwargs)
 
